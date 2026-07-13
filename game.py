@@ -59,7 +59,7 @@ class OthelloGame:
         # ★重要：Renderにデプロイしたあと、発行された自分のURL（https://〜）の
         # 頭を「wss://」に変えて、お尻に「/ws」をつけたものに書き換えてね！
         # （ローカル環境でテストする間は、下の "ws://localhost:10000/ws" のままでOK）
-        server_url = "ws://localhost:10000/ws"
+        server_url = "wss://last-26c0.onrender.com/ws"
         
         self.ws = websocket.WebSocketApp(
             server_url,
