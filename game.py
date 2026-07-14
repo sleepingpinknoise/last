@@ -1,11 +1,12 @@
 import random
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 import os
-import re
+import json
 from dotenv import load_dotenv
-import socket
 import threading
+# 事前に pip install websocket-client しておいてね！
+import websocket 
 
 EMPTY = 0
 HOLE = -1
@@ -73,10 +74,11 @@ class OthelloApp:
         self.next_destroy_targets = []
         self.event_window = None
 
-        # オンライン通信用の変数
+        # 固定されたRenderのWebSocket用URL
+        self.SERVER_URL = "wss://last-26c0.onrender.com/ws"
         self.has_online = False
-        self.conn = None
-        self.server_sock = None
+        self.ws = None
+        self.is_host = False
 
         self.settings = {}
         self.vars = {}
@@ -142,7 +144,7 @@ class OthelloApp:
         return frame
 
     def build_layout(self):
-        self.left = tk.Frame(self.left_root if hasattr(self, 'left_root') else self.root, width=390, bg=PANEL_BG)
+        self.left = tk.Frame(self.root, width=390, bg=PANEL_BG)
         self.left.pack(side=tk.LEFT, fill=tk.Y, padx=14, pady=14)
         self.left.pack_propagate(False)
 
@@ -212,15 +214,10 @@ class OthelloApp:
         self.game_started = False
         self.game_over = False
 
-        # 通信のクリーンアップ
-        if self.conn:
-            try: self.conn.close()
+        if self.ws:
+            try: self.ws.close()
             except: pass
-            self.conn = None
-        if self.server_sock:
-            try: self.server_sock.close()
-            except: pass
-            self.server_sock = None
+            self.ws = None
         self.has_online = False
 
         self.add_player_section()
@@ -495,12 +492,22 @@ class OthelloApp:
 
         self.settings = self.collect_settings()
 
-        # オンライン通信設定の開始
         self.has_online = any(p["kind"] == "オンライン" for p in self.players)
-        if self.has_online:
+        if self.has_online and not self.ws:
             if not self.setup_online_connection():
                 return
+            if not self.is_host:
+                messagebox.showinfo("待機", "ホストが試合を開始するのを待っているってことーー。")
+                return
 
+        self.init_game_states()
+        
+        if self.has_online and self.is_host:
+            self.send_sync_packet()
+
+        self.launch_game_ui()
+
+    def init_game_states(self):
         if self.settings.get("gravity") and self.settings.get("gravity_notice"):
             self.next_gravity = random.choice(list(GRAVITY_DIRECTIONS))
         else:
@@ -509,12 +516,14 @@ class OthelloApp:
             self.next_mirror = random.choice(MIRROR_SIDES)
         else:
             self.next_mirror = None
+
+        self.board = self.create_initial_board()
+        
         if self.settings.get("destroy") and self.settings.get("destroy_notice"):
             self.next_destroy_targets = self.random_piece_targets(self.settings["destroy_count"])
         else:
             self.next_destroy_targets = []
 
-        self.board = self.create_initial_board()
         self.cell_scores = self.generate_random_scores(len(self.board), len(self.board[0]))
         self.ages = [[None for _ in row] for row in self.board]
         self.health = [[None for _ in row] for row in self.board]
@@ -526,55 +535,80 @@ class OthelloApp:
         self.game_started = True
         self.game_over = False
         self.prepare_predictions()
+
+    def launch_game_ui(self):
         self.show_game_controls()
         self.draw_board()
         self.schedule_cpu_if_needed()
 
     def setup_online_connection(self):
-        res = messagebox.askyesno("オンライン設定", "あなたがホスト（接続を待つ側）ですか？")
-        self.conn = None
-        self.server_sock = None
-        port = 50007
-
-        if res:
-            try:
-                self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.server_sock.bind(("0.0.0.0", port))
-                self.server_sock.listen(1)
-                messagebox.showinfo("待機", f"ポート {port} で待機するってことーー。\n相手が接続するまで「OK」を押した後に少し待ってね。")
-                self.server_sock.settimeout(15.0)
-                self.conn, addr = self.server_sock.accept()
-                messagebox.showinfo("接続完了", f"相手が接続してきたってわけ！\n接続先: {addr}")
-            except socket.timeout:
-                messagebox.showerror("エラー", "タイムアウトしちゃったみたい。")
-                return False
-            except Exception as e:
-                messagebox.showerror("エラー", f"接続エラーが発生したってこと: {e}")
-                return False
-        else:
-            ip = simpledialog.askstring("接続先", "ホストのIPアドレスを入力してね:", initialvalue="127.0.0.1")
-            if not ip: return False
-            try:
-                self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.conn.connect((ip, port))
-                messagebox.showinfo("接続完了", "ホストに接続できたってわけーー。さいこー！")
-            except Exception as e:
-                messagebox.showerror("エラー", f"接続に失敗したってこと: {e}")
-                return False
+        res = messagebox.askyesno("オンライン設定", "あなたがホスト（先攻・部屋を立てる側）ですか？")
+        self.is_host = res
+        
+        try:
+            # 固定されたURLへ接続
+            self.ws = websocket.create_connection(self.SERVER_URL, timeout=10.0)
+            messagebox.showinfo("接続完了", "Renderサーバーに接続できたってわけーー。さいこー！")
+        except Exception as e:
+            messagebox.showerror("エラー", f"Renderへの接続に失敗したってこと: {e}")
+            return False
 
         threading.Thread(target=self.receive_online_loop, daemon=True).start()
         return True
 
+    def send_sync_packet(self):
+        packet = {
+            "type": "sync",
+            "settings": self.settings,
+            "holes": list(self.holes),
+            "cell_scores": self.cell_scores,
+            "next_gravity": self.next_gravity,
+            "next_mirror": self.next_mirror,
+            "next_destroy_targets": self.next_destroy_targets,
+            "flip_mission_targets": self.flip_mission_targets
+        }
+        try:
+            self.ws.send(json.dumps(packet))
+        except:
+            pass
+
     def receive_online_loop(self):
         while True:
             try:
-                data = self.conn.recv(1024).decode('utf-8')
-                if not data:
-                    break
-                match = re.match(r"(\d+),(\d+)", data.strip())
-                if match:
-                    r, c = int(match.group(1)), int(match.group(2))
+                msg = self.ws.recv()
+                if not msg: break
+                data = json.loads(msg)
+                
+                if data.get("type") == "sync" and not self.is_host:
+                    self.settings = data["settings"]
+                    self.holes = set(tuple(h) for h in data["holes"])
+                    
+                    self.board = self.create_initial_board()
+                    self.cell_scores = data["cell_scores"]
+                    self.next_gravity = data["next_gravity"]
+                    self.next_mirror = data["next_mirror"]
+                    self.next_destroy_targets = [tuple(t) for t in data["next_destroy_targets"]]
+                    self.flip_mission_targets = data["flip_mission_targets"]
+                    
+                    self.ages = [[None for _ in row] for row in self.board]
+                    self.health = [[None for _ in row] for row in self.board]
+                    self.flip_mission_counters = [self.settings.get("flip_limit_interval", 5) for _ in self.players]
+                    self.is_bonus_turn = False
+                    self.current_player_index = 0
+                    self.turn_count = 0
+                    self.game_started = True
+                    self.game_over = False
+                    
+                    self.root.after(0, self.launch_game_ui)
+                
+                elif data.get("type") == "move":
+                    r, c = data["row"], data["col"]
+                    if "next_events" in data:
+                        ne = data["next_events"]
+                        self.next_gravity = ne["gravity"]
+                        self.next_mirror = ne["mirror"]
+                        self.next_destroy_targets = [tuple(t) for t in ne["destroy_targets"]]
+                        
                     self.root.after(0, lambda: self.remote_place_piece(r, c))
             except:
                 break
@@ -682,13 +716,6 @@ class OthelloApp:
             self.status.config(text="そこには置けません")
             return
 
-        # ローカル側の着手であれば、接続先のオンラインプレイヤーに座標を送信
-        if getattr(self, "has_online", False) and self.players[self.current_player_index]["kind"] != "オンライン":
-            try:
-                self.conn.sendall(f"{row},{col}\n".encode('utf-8'))
-            except:
-                pass
-
         self.board[row][col] = player
         self.ages[row][col] = 0 if self.settings.get("life") else None
         self.health[row][col] = self.settings.get("health_count") if self.settings.get("health") else None
@@ -720,9 +747,28 @@ class OthelloApp:
                         messagebox.showinfo("ミッション達成", f"ぴったり{len(flips)}個反転させました！連続手番を獲得します。")
                         is_bonus = True
                     self.flip_mission_counters[pi] = max(1, self.settings.get("flip_limit_interval", 5))
-                    self.flip_mission_targets[pi] = random.randint(1, 4)
                 else:
                     self.flip_mission_counters[pi] -= 1
+
+        if self.has_online and self.is_host:
+            self.prepare_predictions()
+
+        if self.has_online and self.players[self.current_player_index]["kind"] != "オンライン":
+            move_packet = {
+                "type": "move",
+                "row": row,
+                "col": col
+            }
+            if self.is_host:
+                move_packet["next_events"] = {
+                    "gravity": self.next_gravity,
+                    "mirror": self.next_mirror,
+                    "destroy_targets": self.next_destroy_targets
+                }
+            try:
+                self.ws.send(json.dumps(move_packet))
+            except:
+                pass
 
         if is_bonus and self.valid_moves(self.current_player()):
             next_index = self.current_player_index
@@ -735,7 +781,10 @@ class OthelloApp:
             self.end_game()
             return
         self.current_player_index = next_index
-        self.prepare_predictions()
+        
+        if not (self.has_online and not self.is_host):
+            self.prepare_predictions()
+            
         self.draw_board()
         self.schedule_cpu_if_needed()
 
@@ -871,17 +920,17 @@ class OthelloApp:
 
     def prepare_predictions(self):
         if self.settings.get("gravity") and self.settings.get("gravity_notice"):
-            if self.next_gravity == None:
+            if self.next_gravity is None:
                 self.next_gravity = random.choice(list(GRAVITY_DIRECTIONS))
         else:
             self.next_gravity = None
         if self.settings.get("mirror") and self.settings.get("mirror_notice"):
-            if self.next_mirror == None:
+            if self.next_mirror is None:
                 self.next_mirror = random.choice(MIRROR_SIDES)
         else:
             self.next_mirror = None
         if self.settings.get("destroy") and self.settings.get("destroy_notice"):
-            if self.next_destroy_targets == []:
+            if not self.next_destroy_targets:
                 self.next_destroy_targets = self.random_piece_targets(self.settings["destroy_count"])
         else:
             self.next_destroy_targets = []
@@ -929,14 +978,14 @@ class OthelloApp:
     def cell_from_event(self, event):
         if self.game_started and self.board:
             rows = len(self.board)
-            cols = len(self.board[0])
+            counts_cols = len(self.board[0])
         else:
             rows = self.vars["rows"].get()
-            cols = self.vars["cols"].get()
-        size, offset_x, offset_y = self.board_geometry(rows, cols)
+            counts_cols = self.vars["cols"].get()
+        size, offset_x, offset_y = self.board_geometry(rows, counts_cols)
         col = int((event.x - offset_x) // size)
         row = int((event.y - offset_y) // size)
-        if 0 <= row < rows and 0 <= col < cols:
+        if 0 <= row < rows and 0 <= col < counts_cols:
             return row, col
         return None
 
